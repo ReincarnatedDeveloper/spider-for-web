@@ -1,18 +1,13 @@
 {
   "name": "spider-for-web",
   "version": "1.0.0",
-  "description": "Scraping service with Cloudflare bypass fallback chain",
+  "description": "Playwright web scraping service",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^5.2.1",
-    "playwright": "^1.63.0",
-    "puppeteer": "^25.12.0",
-    "selenium-webdriver": "^4.50.0"
-  },
-  "allowScripts": {
-    "puppeteer": true
+    "playwright": "1.63.0"
   }
 }

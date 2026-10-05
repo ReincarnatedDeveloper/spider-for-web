@@ -1,19 +1,12 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
-const { chromium: playwrightChromium } = require('playwright');
-const { Builder, Browser } = require('selenium-webdriver');
-const chrome = require('selenium-webdriver/chrome');
+const { chromium } = require('playwright');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const CHROMIUM_PATH =
-    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
-    '/ms-playwright/chromium-1124/chrome-linux/chrome';
-
 // ---------------------------------------------------------
-// Logging & Helpers
+// Logging
 // ---------------------------------------------------------
 
 function log(level, message, meta = {}) {
@@ -23,271 +16,415 @@ function log(level, message, meta = {}) {
         message,
         ...meta
     };
-    console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](
-        JSON.stringify(entry)
-    );
+
+    const logger =
+        level === 'error'
+            ? console.error
+            : level === 'warn'
+                ? console.warn
+                : console.log;
+
+    logger(JSON.stringify(entry));
 }
 
 function getErrorDetails(err) {
     return {
-        error: err?.message,
+        error: err?.message || 'Unknown error',
         stack: err?.stack,
         name: err?.name
     };
 }
 
-async function isCloudflareActive(pageOrSource, isPuppeteerOrPlaywright = true) {
-    let html = '';
-    let title = '';
-
-    if (isPuppeteerOrPlaywright) {
-        html = await pageOrSource.content();
-        title = await pageOrSource.title().catch(() => '');
-    } else {
-        html = pageOrSource; // Selenium page source
-    }
-
-    const isChallengedTitle = title === 'Just a moment...' || title.includes('Attention Required');
-    const hasChallengeContent = html.includes('Just a moment...') || html.includes('cf-browser-verification');
-
-    return isChallengedTitle || hasChallengeContent;
-}
-
-// Wait for Cloudflare's background JS challenge to auto-solve (up to 15s)
-async function waitForCloudflareClear(page, requestId) {
-    const deadline = Date.now() + 15000;
-    
-    while (Date.now() < deadline) {
-        if (!(await isCloudflareActive(page, true))) {
-            log('info', 'Cloudflare challenge cleared successfully', { requestId });
-            return true;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-    return false;
-}
-
+// ---------------------------------------------------------
 // Request ID Middleware
+// ---------------------------------------------------------
+
 app.use((req, res, next) => {
     const requestId = crypto.randomUUID();
     const start = Date.now();
 
     req.requestId = requestId;
+
     res.setHeader('X-Request-ID', requestId);
 
-    log('info', 'Request started', { requestId, method: req.method, path: req.path });
+    log('info', 'Request started', {
+        requestId,
+        method: req.method,
+        path: req.path
+    });
 
     res.on('finish', () => {
-        log('info', 'Request completed', { requestId, statusCode: res.statusCode, durationMs: Date.now() - start });
+        log('info', 'Request completed', {
+            requestId,
+            statusCode: res.statusCode,
+            durationMs: Date.now() - start
+        });
     });
 
     next();
 });
 
 // ---------------------------------------------------------
-// Puppeteer (Evasion Enabled)
+// Health Check
 // ---------------------------------------------------------
-async function scrapeWithPuppeteer(targetUrl, requestId) {
-    let browser;
-    const start = Date.now();
-    log('info', 'Puppeteer started', { requestId, targetUrl });
+
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'ok',
+        service: 'spider-for-web',
+        timestamp: new Date().toISOString()
+    });
+});
+
+// ---------------------------------------------------------
+// URL Validation
+// ---------------------------------------------------------
+
+function validateTargetUrl(targetUrl) {
+    if (!targetUrl || typeof targetUrl !== 'string') {
+        throw new Error('Missing URL');
+    }
+
+    let parsedUrl;
 
     try {
-        browser = await puppeteer.launch({
+        parsedUrl = new URL(targetUrl);
+    } catch {
+        throw new Error('Invalid URL');
+    }
+
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('Only HTTP and HTTPS URLs are supported');
+    }
+
+    return parsedUrl;
+}
+
+// ---------------------------------------------------------
+// Basic SSRF Protection
+// ---------------------------------------------------------
+
+function isPrivateHostname(hostname) {
+    const host = hostname.toLowerCase();
+
+    // Localhost
+    if (
+        host === 'localhost' ||
+        host === 'localhost.localdomain' ||
+        host === '127.0.0.1' ||
+        host === '0.0.0.0' ||
+        host === '::1'
+    ) {
+        return true;
+    }
+
+    // Local domains
+    if (
+        host.endsWith('.local') ||
+        host.endsWith('.localhost') ||
+        host.endsWith('.internal')
+    ) {
+        return true;
+    }
+
+    // IPv4 private/reserved ranges
+    const privateIpv4Patterns = [
+        /^10\./,
+        /^127\./,
+        /^169\.254\./,
+        /^192\.168\./,
+        /^172\.(1[6-9]|2[0-9]|3[0-1])\./
+    ];
+
+    return privateIpv4Patterns.some((pattern) =>
+        pattern.test(host)
+    );
+}
+
+// ---------------------------------------------------------
+// Cloudflare / Challenge Detection
+// ---------------------------------------------------------
+
+async function getPageInfo(page) {
+    let html = '';
+    let title = '';
+
+    try {
+        html = await page.content();
+    } catch (_) {
+        // Ignore
+    }
+
+    try {
+        title = await page.title();
+    } catch (_) {
+        // Ignore
+    }
+
+    return {
+        html,
+        title
+    };
+}
+
+async function isCloudflareActive(page) {
+    const { html, title } = await getPageInfo(page);
+
+    const normalizedTitle = title.toLowerCase();
+
+    const challengeTitle =
+        title === 'Just a moment...' ||
+        normalizedTitle.includes('attention required') ||
+        normalizedTitle.includes('checking your browser');
+
+    const challengeContent =
+        html.includes('Just a moment...') ||
+        html.includes('cf-browser-verification') ||
+        html.includes('cf-chl-') ||
+        html.includes('challenge-platform');
+
+    return challengeTitle || challengeContent;
+}
+
+// ---------------------------------------------------------
+// Playwright Scraper
+// ---------------------------------------------------------
+
+async function scrapeWithPlaywright(targetUrl, requestId) {
+    let browser;
+
+    const start = Date.now();
+
+    log('info', 'Playwright started', {
+        requestId,
+        targetUrl
+    });
+
+    try {
+        // IMPORTANT:
+        // Do not specify executablePath.
+        //
+        // The official Playwright Docker image already contains
+        // the matching Chromium browser.
+        browser = await chromium.launch({
             headless: true,
-            executablePath: CHROMIUM_PATH,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-blink-features=AutomationControlled',
-                '--window-size=1920,1080'
+                '--disable-gpu'
             ]
         });
 
-        const page = await browser.newPage();
-        
-        // Hide automation variables from Cloudflare
-        await page.evaluateOnNewDocument(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            window.navigator.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        });
-
-        await page.setViewport({ width: 1920, height: 1080 });
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
-
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        // Wait out the Cloudflare interstitial if present
-        if (await isCloudflareActive(page, true)) {
-            log('info', 'Cloudflare challenge detected, waiting for resolution...', { requestId });
-            const cleared = await waitForCloudflareClear(page, requestId);
-            if (!cleared) {
-                throw new Error('Cloudflare challenge persisted / interactive verification required');
-            }
-        }
-
-        const html = await page.content();
-        log('info', 'Puppeteer succeeded', { requestId, targetUrl, durationMs: Date.now() - start });
-        return html;
-    } catch (err) {
-        log('error', 'Puppeteer failed', { requestId, targetUrl, ...getErrorDetails(err) });
-        throw err;
-    } finally {
-        if (browser) await browser.close().catch(() => {});
-    }
-}
-
-// ---------------------------------------------------------
-// Playwright (Evasion Enabled)
-// ---------------------------------------------------------
-async function scrapeWithPlaywright(targetUrl, requestId) {
-    let browser;
-    const start = Date.now();
-    log('info', 'Playwright started', { requestId, targetUrl });
-
-    try {
-        browser = await playwrightChromium.launch({
-            headless: true,
-            executablePath: CHROMIUM_PATH,
-            args: [
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox'
-            ]
+        log('info', 'Chromium launched', {
+            requestId
         });
 
         const context = await browser.newContext({
-            viewport: { width: 1920, height: 1080 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-        });
-
-        // Inject stealth scripts before every page load
-        await context.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            window.navigator.chrome = { runtime: {} };
+            viewport: {
+                width: 1920,
+                height: 1080
+            },
+            locale: 'en-US',
+            timezoneId: 'UTC'
         });
 
         const page = await context.newPage();
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        if (await isCloudflareActive(page, true)) {
-            log('info', 'Cloudflare challenge detected, waiting for resolution...', { requestId });
-            const cleared = await waitForCloudflareClear(page, requestId);
-            if (!cleared) {
-                throw new Error('Cloudflare challenge persisted / interactive verification required');
-            }
+        page.setDefaultNavigationTimeout(30000);
+        page.setDefaultTimeout(30000);
+
+        log('info', 'Navigating to target', {
+            requestId,
+            targetUrl
+        });
+
+        const response = await page.goto(targetUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+        });
+
+        const statusCode = response
+            ? response.status()
+            : null;
+
+        log('info', 'Navigation completed', {
+            requestId,
+            targetUrl,
+            statusCode,
+            finalUrl: page.url()
+        });
+
+        // Give normal client-side JavaScript a short opportunity
+        // to finish rendering.
+        await page.waitForTimeout(1000);
+
+        // Detect challenge rather than pretending that it was
+        // successfully bypassed.
+        if (await isCloudflareActive(page)) {
+            const { title } = await getPageInfo(page);
+
+            log('warn', 'Target returned a Cloudflare challenge', {
+                requestId,
+                targetUrl,
+                title,
+                finalUrl: page.url()
+            });
+
+            throw new Error(
+                'Target returned a Cloudflare challenge or verification page'
+            );
         }
 
         const html = await page.content();
-        log('info', 'Playwright succeeded', { requestId, targetUrl, durationMs: Date.now() - start });
+
+        log('info', 'Playwright succeeded', {
+            requestId,
+            targetUrl,
+            finalUrl: page.url(),
+            statusCode,
+            htmlLength: html.length,
+            durationMs: Date.now() - start
+        });
+
         return html;
+
     } catch (err) {
-        log('error', 'Playwright failed', { requestId, targetUrl, ...getErrorDetails(err) });
+        log('error', 'Playwright failed', {
+            requestId,
+            targetUrl,
+            durationMs: Date.now() - start,
+            ...getErrorDetails(err)
+        });
+
         throw err;
+
     } finally {
-        if (browser) await browser.close().catch(() => {});
+        if (browser) {
+            await browser.close().catch((closeError) => {
+                log('warn', 'Failed to close browser', {
+                    requestId,
+                    error: closeError.message
+                });
+            });
+        }
     }
 }
 
 // ---------------------------------------------------------
-// Selenium (Evasion Enabled)
+// Main Scrape Endpoint
 // ---------------------------------------------------------
-async function scrapeWithSelenium(targetUrl, requestId) {
-    let driver;
-    const start = Date.now();
-    log('info', 'Selenium started', { requestId, targetUrl });
 
-    try {
-        const options = new chrome.Options();
-        options.setChromeBinaryPath(CHROMIUM_PATH);
-        options.addArguments(
-            '--headless',
-            '--no-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-blink-features=AutomationControlled',
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-        );
-        options.excludeSwitches('enable-automation');
-        options.setExperimentalOption('useAutomationExtension', false);
-
-        driver = await new Builder()
-            .forBrowser(Browser.CHROME)
-            .setChromeOptions(options)
-            .build();
-
-        await driver.get(targetUrl);
-
-        let html = await driver.getPageSource();
-        if (html.includes('Just a moment...')) {
-            log('info', 'Cloudflare challenge detected in Selenium, waiting...', { requestId });
-            const deadline = Date.now() + 15000;
-            while (Date.now() < deadline) {
-                html = await driver.getPageSource();
-                if (!html.includes('Just a moment...')) break;
-                await new Promise((r) => setTimeout(r, 1000));
-            }
-        }
-
-        if (html.includes('Just a moment...')) {
-            throw new Error('Cloudflare challenge persisted in Selenium');
-        }
-
-        log('info', 'Selenium succeeded', { requestId, targetUrl, durationMs: Date.now() - start });
-        return html;
-    } catch (err) {
-        log('error', 'Selenium failed', { requestId, targetUrl, ...getErrorDetails(err) });
-        throw err;
-    } finally {
-        if (driver) await driver.quit().catch(() => {});
-    }
-}
-
-// ---------------------------------------------------------
-// Route Handler (Waterfall Fallback)
-// ---------------------------------------------------------
 app.get('/', async (req, res) => {
     const { requestId } = req;
     const targetUrl = req.query.url;
 
     if (!targetUrl) {
-        return res.status(400).send('Error: Please provide a URL using the ?url= query parameter.');
+        return res.status(400).json({
+            error: 'Please provide a URL using the ?url= query parameter.',
+            example: '/?url=https%3A%2F%2Fexample.com',
+            requestId
+        });
     }
 
-    const errors = [];
-    const engines = [
-        { name: 'puppeteer', fn: scrapeWithPuppeteer },
-        { name: 'playwright', fn: scrapeWithPlaywright },
-        { name: 'selenium', fn: scrapeWithSelenium }
-    ];
+    let parsedUrl;
 
-    for (const [index, engine] of engines.entries()) {
-        try {
-            log('info', 'Trying scraping engine', { requestId, engine: engine.name, attempt: index + 1, totalAttempts: engines.length });
-            const html = await engine.fn(targetUrl, requestId);
-
-            res.setHeader('Content-Type', 'text/html; charset=utf-8');
-            return res.send(html);
-        } catch (err) {
-            errors.push(`${engine.name}: ${err.message}`);
-            log('warn', 'Moving to next scraping engine', { requestId, failedEngine: engine.name });
-        }
+    try {
+        parsedUrl = validateTargetUrl(targetUrl);
+    } catch (err) {
+        return res.status(400).json({
+            error: err.message,
+            requestId
+        });
     }
 
-    log('error', 'All scraping engines failed', { requestId, targetUrl, errors });
-    return res.status(500).send(
-        `All scraping engines failed due to Cloudflare protection.<br><br>` +
-        `Request ID: ${requestId}<br><br>` +
-        `Errors:<br>- ${errors.join('<br>- ')}`
-    );
+    // Basic SSRF protection
+    if (isPrivateHostname(parsedUrl.hostname)) {
+        log('warn', 'Blocked private/internal target', {
+            requestId,
+            hostname: parsedUrl.hostname
+        });
+
+        return res.status(403).json({
+            error: 'Private or internal destinations are not allowed.',
+            requestId
+        });
+    }
+
+    const normalizedUrl = parsedUrl.toString();
+
+    log('info', 'Scrape request accepted', {
+        requestId,
+        targetUrl: normalizedUrl
+    });
+
+    try {
+        const html = await scrapeWithPlaywright(
+            normalizedUrl,
+            requestId
+        );
+
+        res.status(200);
+        res.setHeader(
+            'Content-Type',
+            'text/html; charset=utf-8'
+        );
+
+        return res.send(html);
+
+    } catch (err) {
+        log('error', 'Scrape request failed', {
+            requestId,
+            targetUrl: normalizedUrl,
+            ...getErrorDetails(err)
+        });
+
+        return res.status(500).json({
+            error: 'Scraping failed',
+            message: err.message,
+            requestId
+        });
+    }
+});
+
+// ---------------------------------------------------------
+// 404 Handler
+// ---------------------------------------------------------
+
+app.use((req, res) => {
+    res.status(404).json({
+        error: 'Not found',
+        requestId: req.requestId
+    });
+});
+
+// ---------------------------------------------------------
+// Global Error Handler
+// ---------------------------------------------------------
+
+app.use((err, req, res, next) => {
+    log('error', 'Unhandled Express error', {
+        requestId: req.requestId,
+        ...getErrorDetails(err)
+    });
+
+    if (res.headersSent) {
+        return next(err);
+    }
+
+    res.status(500).json({
+        error: 'Internal server error',
+        requestId: req.requestId
+    });
 });
 
 // ---------------------------------------------------------
 // Server
 // ---------------------------------------------------------
-app.listen(PORT, () => {
-    log('info', 'Stealth multi-engine scraper started', { port: PORT, chromiumPath: CHROMIUM_PATH });
+
+app.listen(PORT, '0.0.0.0', () => {
+    log('info', 'Scraper service started', {
+        port: PORT,
+        playwrightVersion: '1.63.0'
+    });
 });
