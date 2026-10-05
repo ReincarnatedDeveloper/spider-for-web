@@ -1,0 +1,14 @@
+{
+  "name": "spider-for-web",
+  "version": "1.0.0",
+  "description": "Scrape website HTML using Selenium with Playwright fallback on Render",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.45.0",
+    "selenium-webdriver": "^4.21.0"
+  }
+}
