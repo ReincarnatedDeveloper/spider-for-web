@@ -1,9 +1,20 @@
+'use strict';
+
 const express = require('express');
-const { chromium } = require('playwright');
 const crypto = require('crypto');
+const { chromium } = require('playwright');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+
+const PORT = Number(process.env.PORT) || 3000;
+
+// ---------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------
+
+const NAVIGATION_TIMEOUT = 30_000;
+const CHALLENGE_WAIT_TIMEOUT = 15_000;
+const POST_NAVIGATION_WAIT = 1_000;
 
 // ---------------------------------------------------------
 // Logging
@@ -17,21 +28,20 @@ function log(level, message, meta = {}) {
         ...meta
     };
 
-    const logger =
-        level === 'error'
-            ? console.error
-            : level === 'warn'
-                ? console.warn
-                : console.log;
-
-    logger(JSON.stringify(entry));
+    if (level === 'error') {
+        console.error(JSON.stringify(entry));
+    } else if (level === 'warn') {
+        console.warn(JSON.stringify(entry));
+    } else {
+        console.log(JSON.stringify(entry));
+    }
 }
 
 function getErrorDetails(err) {
     return {
         error: err?.message || 'Unknown error',
-        stack: err?.stack,
-        name: err?.name
+        name: err?.name,
+        stack: err?.stack
     };
 }
 
@@ -50,12 +60,15 @@ app.use((req, res, next) => {
     log('info', 'Request started', {
         requestId,
         method: req.method,
-        path: req.path
+        path: req.path,
+        query: req.query
     });
 
     res.on('finish', () => {
         log('info', 'Request completed', {
             requestId,
+            method: req.method,
+            path: req.path,
             statusCode: res.statusCode,
             durationMs: Date.now() - start
         });
@@ -85,6 +98,10 @@ function validateTargetUrl(targetUrl) {
         throw new Error('Missing URL');
     }
 
+    if (targetUrl.length > 2048) {
+        throw new Error('URL is too long');
+    }
+
     let parsedUrl;
 
     try {
@@ -94,7 +111,13 @@ function validateTargetUrl(targetUrl) {
     }
 
     if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-        throw new Error('Only HTTP and HTTPS URLs are supported');
+        throw new Error(
+            'Only HTTP and HTTPS URLs are supported'
+        );
+    }
+
+    if (!parsedUrl.hostname) {
+        throw new Error('URL must contain a hostname');
     }
 
     return parsedUrl;
@@ -105,9 +128,9 @@ function validateTargetUrl(targetUrl) {
 // ---------------------------------------------------------
 
 function isPrivateHostname(hostname) {
-    const host = hostname.toLowerCase();
+    const host = String(hostname || '').toLowerCase();
 
-    // Localhost
+    // Localhost / loopback
     if (
         host === 'localhost' ||
         host === 'localhost.localdomain' ||
@@ -118,7 +141,7 @@ function isPrivateHostname(hostname) {
         return true;
     }
 
-    // Local domains
+    // Local/internal domains
     if (
         host.endsWith('.local') ||
         host.endsWith('.localhost') ||
@@ -136,13 +159,13 @@ function isPrivateHostname(hostname) {
         /^172\.(1[6-9]|2[0-9]|3[0-1])\./
     ];
 
-    return privateIpv4Patterns.some((pattern) =>
-        pattern.test(host)
-    );
+    return privateIpv4Patterns.some((pattern) => {
+        return pattern.test(host);
+    });
 }
 
 // ---------------------------------------------------------
-// Cloudflare / Challenge Detection
+// Cloudflare / Verification Detection
 // ---------------------------------------------------------
 
 async function getPageInfo(page) {
@@ -151,14 +174,20 @@ async function getPageInfo(page) {
 
     try {
         html = await page.content();
-    } catch (_) {
-        // Ignore
+    } catch (err) {
+        log('warn', 'Unable to read page content', {
+            requestId: page.__requestId,
+            error: err.message
+        });
     }
 
     try {
         title = await page.title();
-    } catch (_) {
-        // Ignore
+    } catch (err) {
+        log('warn', 'Unable to read page title', {
+            requestId: page.__requestId,
+            error: err.message
+        });
     }
 
     return {
@@ -181,17 +210,56 @@ async function isCloudflareActive(page) {
         html.includes('Just a moment...') ||
         html.includes('cf-browser-verification') ||
         html.includes('cf-chl-') ||
-        html.includes('challenge-platform');
+        html.includes('challenge-platform') ||
+        html.includes('__cf_chl_');
 
     return challengeTitle || challengeContent;
+}
+
+// ---------------------------------------------------------
+// Wait for an automatically resolving challenge
+// ---------------------------------------------------------
+
+async function waitForChallengeToFinish(
+    page,
+    requestId,
+    timeoutMs = CHALLENGE_WAIT_TIMEOUT
+) {
+    const deadline = Date.now() + timeoutMs;
+
+    log('info', 'Waiting for verification page to clear', {
+        requestId,
+        timeoutMs
+    });
+
+    while (Date.now() < deadline) {
+        const active = await isCloudflareActive(page);
+
+        if (!active) {
+            log('info', 'Verification page cleared', {
+                requestId,
+                finalUrl: page.url()
+            });
+
+            return true;
+        }
+
+        await page.waitForTimeout(1000);
+    }
+
+    return false;
 }
 
 // ---------------------------------------------------------
 // Playwright Scraper
 // ---------------------------------------------------------
 
-async function scrapeWithPlaywright(targetUrl, requestId) {
-    let browser;
+async function scrapeWithPlaywright(
+    targetUrl,
+    requestId
+) {
+    let browser = null;
+    let context = null;
 
     const start = Date.now();
 
@@ -201,13 +269,21 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
     });
 
     try {
-        // IMPORTANT:
-        // Do not specify executablePath.
+        // -------------------------------------------------
+        // IMPORTANT
         //
-        // The official Playwright Docker image already contains
-        // the matching Chromium browser.
+        // No executablePath is specified.
+        //
+        // The official Playwright Docker image:
+        //
+        // mcr.microsoft.com/playwright:v1.63.0-noble
+        //
+        // already contains the matching Chromium.
+        // -------------------------------------------------
+
         browser = await chromium.launch({
             headless: true,
+
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -220,19 +296,41 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
             requestId
         });
 
-        const context = await browser.newContext({
+        // -------------------------------------------------
+        // Browser Context
+        // -------------------------------------------------
+
+        context = await browser.newContext({
             viewport: {
                 width: 1920,
                 height: 1080
             },
+
             locale: 'en-US',
+
             timezoneId: 'UTC'
         });
 
+        // -------------------------------------------------
+        // Page
+        // -------------------------------------------------
+
         const page = await context.newPage();
 
-        page.setDefaultNavigationTimeout(30000);
-        page.setDefaultTimeout(30000);
+        // Store request ID for logging helpers
+        page.__requestId = requestId;
+
+        page.setDefaultNavigationTimeout(
+            NAVIGATION_TIMEOUT
+        );
+
+        page.setDefaultTimeout(
+            NAVIGATION_TIMEOUT
+        );
+
+        // -------------------------------------------------
+        // Navigation
+        // -------------------------------------------------
 
         log('info', 'Navigating to target', {
             requestId,
@@ -241,42 +339,72 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
 
         const response = await page.goto(targetUrl, {
             waitUntil: 'domcontentloaded',
-            timeout: 30000
+            timeout: NAVIGATION_TIMEOUT
         });
 
         const statusCode = response
             ? response.status()
             : null;
 
+        const finalUrl = page.url();
+
         log('info', 'Navigation completed', {
             requestId,
             targetUrl,
-            statusCode,
-            finalUrl: page.url()
+            finalUrl,
+            statusCode
         });
 
-        // Give normal client-side JavaScript a short opportunity
-        // to finish rendering.
-        await page.waitForTimeout(1000);
+        // -------------------------------------------------
+        // Give normal page JavaScript some time
+        // -------------------------------------------------
 
-        // Detect challenge rather than pretending that it was
-        // successfully bypassed.
+        await page.waitForTimeout(
+            POST_NAVIGATION_WAIT
+        );
+
+        // -------------------------------------------------
+        // Check for verification/challenge page
+        // -------------------------------------------------
+
         if (await isCloudflareActive(page)) {
             const { title } = await getPageInfo(page);
 
-            log('warn', 'Target returned a Cloudflare challenge', {
+            log('warn', 'Verification challenge detected', {
                 requestId,
                 targetUrl,
-                title,
-                finalUrl: page.url()
+                finalUrl: page.url(),
+                statusCode,
+                title
             });
 
-            throw new Error(
-                'Target returned a Cloudflare challenge or verification page'
-            );
+            // Allow an ordinary automatically-resolving
+            // challenge some time to finish.
+            const cleared =
+                await waitForChallengeToFinish(
+                    page,
+                    requestId,
+                    CHALLENGE_WAIT_TIMEOUT
+                );
+
+            if (!cleared) {
+                throw new Error(
+                    'Target returned a Cloudflare or verification challenge that did not clear automatically'
+                );
+            }
         }
 
+        // -------------------------------------------------
+        // Get final HTML
+        // -------------------------------------------------
+
         const html = await page.content();
+
+        if (!html || html.length === 0) {
+            throw new Error(
+                'Target returned an empty HTML document'
+            );
+        }
 
         log('info', 'Playwright succeeded', {
             requestId,
@@ -287,7 +415,11 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
             durationMs: Date.now() - start
         });
 
-        return html;
+        return {
+            html,
+            statusCode,
+            finalUrl: page.url()
+        };
 
     } catch (err) {
         log('error', 'Playwright failed', {
@@ -300,13 +432,34 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
         throw err;
 
     } finally {
+        // -------------------------------------------------
+        // Close context first
+        // -------------------------------------------------
+
+        if (context) {
+            try {
+                await context.close();
+            } catch (err) {
+                log('warn', 'Failed to close browser context', {
+                    requestId,
+                    error: err.message
+                });
+            }
+        }
+
+        // -------------------------------------------------
+        // Then close browser
+        // -------------------------------------------------
+
         if (browser) {
-            await browser.close().catch((closeError) => {
+            try {
+                await browser.close();
+            } catch (err) {
                 log('warn', 'Failed to close browser', {
                     requestId,
-                    error: closeError.message
+                    error: err.message
                 });
-            });
+            }
         }
     }
 }
@@ -317,20 +470,35 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
 
 app.get('/', async (req, res) => {
     const { requestId } = req;
+
     const targetUrl = req.query.url;
+
+    // -----------------------------------------------------
+    // Check URL exists
+    // -----------------------------------------------------
 
     if (!targetUrl) {
         return res.status(400).json({
-            error: 'Please provide a URL using the ?url= query parameter.',
-            example: '/?url=https%3A%2F%2Fexample.com',
+            error:
+                'Please provide a URL using the ?url= query parameter.',
+
+            example:
+                '/?url=https%3A%2F%2Fexample.com',
+
             requestId
         });
     }
 
+    // -----------------------------------------------------
+    // Validate URL
+    // -----------------------------------------------------
+
     let parsedUrl;
 
     try {
-        parsedUrl = validateTargetUrl(targetUrl);
+        parsedUrl =
+            validateTargetUrl(targetUrl);
+
     } catch (err) {
         return res.status(400).json({
             error: err.message,
@@ -338,39 +506,55 @@ app.get('/', async (req, res) => {
         });
     }
 
-    // Basic SSRF protection
-    if (isPrivateHostname(parsedUrl.hostname)) {
+    // -----------------------------------------------------
+    // SSRF protection
+    // -----------------------------------------------------
+
+    if (
+        isPrivateHostname(
+            parsedUrl.hostname
+        )
+    ) {
         log('warn', 'Blocked private/internal target', {
             requestId,
             hostname: parsedUrl.hostname
         });
 
         return res.status(403).json({
-            error: 'Private or internal destinations are not allowed.',
+            error:
+                'Private or internal destinations are not allowed.',
+
             requestId
         });
     }
 
-    const normalizedUrl = parsedUrl.toString();
+    const normalizedUrl =
+        parsedUrl.toString();
 
     log('info', 'Scrape request accepted', {
         requestId,
         targetUrl: normalizedUrl
     });
 
+    // -----------------------------------------------------
+    // Scrape
+    // -----------------------------------------------------
+
     try {
-        const html = await scrapeWithPlaywright(
-            normalizedUrl,
-            requestId
-        );
+        const result =
+            await scrapeWithPlaywright(
+                normalizedUrl,
+                requestId
+            );
 
         res.status(200);
+
         res.setHeader(
             'Content-Type',
             'text/html; charset=utf-8'
         );
 
-        return res.send(html);
+        return res.send(result.html);
 
     } catch (err) {
         log('error', 'Scrape request failed', {
@@ -379,7 +563,7 @@ app.get('/', async (req, res) => {
             ...getErrorDetails(err)
         });
 
-        return res.status(500).json({
+        return res.status(502).json({
             error: 'Scraping failed',
             message: err.message,
             requestId
@@ -394,6 +578,7 @@ app.get('/', async (req, res) => {
 app.use((req, res) => {
     res.status(404).json({
         error: 'Not found',
+        path: req.path,
         requestId: req.requestId
     });
 });
@@ -412,19 +597,55 @@ app.use((err, req, res, next) => {
         return next(err);
     }
 
-    res.status(500).json({
+    return res.status(500).json({
         error: 'Internal server error',
         requestId: req.requestId
     });
 });
 
 // ---------------------------------------------------------
-// Server
+// Graceful Shutdown
 // ---------------------------------------------------------
 
-app.listen(PORT, '0.0.0.0', () => {
-    log('info', 'Scraper service started', {
-        port: PORT,
-        playwrightVersion: '1.63.0'
+function shutdown(signal) {
+    log('info', 'Shutdown signal received', {
+        signal
     });
+
+    server.close(() => {
+        log('info', 'HTTP server closed');
+
+        process.exit(0);
+    });
+
+    // Don't wait forever for connections to close.
+    setTimeout(() => {
+        log('warn', 'Forced shutdown');
+
+        process.exit(1);
+    }, 10_000).unref();
+}
+
+// ---------------------------------------------------------
+// Start Server
+// ---------------------------------------------------------
+
+const server = app.listen(
+    PORT,
+    '0.0.0.0',
+    () => {
+        log('info', 'Scraper service started', {
+            port: PORT,
+            playwrightVersion: '1.63.0',
+            healthEndpoint: '/health'
+        });
+    }
+);
+
+process.on('SIGTERM', () => {
+    shutdown('SIGTERM');
+});
+
+process.on('SIGINT', () => {
+    shutdown('SIGINT');
 });
