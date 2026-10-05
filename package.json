@@ -1,7 +1,7 @@
 {
   "name": "spider-for-web",
   "version": "1.0.0",
-  "description": "Scraping service with Puppeteer -> Playwright -> Selenium fallback chain",
+  "description": "Scraping service with Cloudflare bypass fallback chain",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

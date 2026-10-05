@@ -23,7 +23,6 @@ function log(level, message, meta = {}) {
         message,
         ...meta
     };
-
     console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](
         JSON.stringify(entry)
     );
@@ -37,12 +36,38 @@ function getErrorDetails(err) {
     };
 }
 
-function detectCloudflare(html) {
-    // Checks for common Cloudflare challenge indicators
-    return html.includes('Just a moment...') || html.includes('cf-browser-verification');
+async function isCloudflareActive(pageOrSource, isPuppeteerOrPlaywright = true) {
+    let html = '';
+    let title = '';
+
+    if (isPuppeteerOrPlaywright) {
+        html = await pageOrSource.content();
+        title = await pageOrSource.title().catch(() => '');
+    } else {
+        html = pageOrSource; // Selenium page source
+    }
+
+    const isChallengedTitle = title === 'Just a moment...' || title.includes('Attention Required');
+    const hasChallengeContent = html.includes('Just a moment...') || html.includes('cf-browser-verification');
+
+    return isChallengedTitle || hasChallengeContent;
 }
 
-// Add request ID to every request
+// Wait for Cloudflare's background JS challenge to auto-solve (up to 15s)
+async function waitForCloudflareClear(page, requestId) {
+    const deadline = Date.now() + 15000;
+    
+    while (Date.now() < deadline) {
+        if (!(await isCloudflareActive(page, true))) {
+            log('info', 'Cloudflare challenge cleared successfully', { requestId });
+            return true;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return false;
+}
+
+// Request ID Middleware
 app.use((req, res, next) => {
     const requestId = crypto.randomUUID();
     const start = Date.now();
@@ -50,34 +75,21 @@ app.use((req, res, next) => {
     req.requestId = requestId;
     res.setHeader('X-Request-ID', requestId);
 
-    log('info', 'Request started', {
-        requestId,
-        method: req.method,
-        path: req.path,
-        url: req.originalUrl
-    });
+    log('info', 'Request started', { requestId, method: req.method, path: req.path });
 
     res.on('finish', () => {
-        log('info', 'Request completed', {
-            requestId,
-            method: req.method,
-            path: req.path,
-            statusCode: res.statusCode,
-            durationMs: Date.now() - start
-        });
+        log('info', 'Request completed', { requestId, statusCode: res.statusCode, durationMs: Date.now() - start });
     });
 
     next();
 });
 
 // ---------------------------------------------------------
-// Puppeteer
+// Puppeteer (Evasion Enabled)
 // ---------------------------------------------------------
-
 async function scrapeWithPuppeteer(targetUrl, requestId) {
     let browser;
     const start = Date.now();
-
     log('info', 'Puppeteer started', { requestId, targetUrl });
 
     try {
@@ -88,129 +100,119 @@ async function scrapeWithPuppeteer(targetUrl, requestId) {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
+                '--window-size=1920,1080'
             ]
         });
 
         const page = await browser.newPage();
-
-        await page.goto(targetUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
+        
+        // Hide automation variables from Cloudflare
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            window.navigator.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         });
 
-        const html = await page.content();
+        await page.setViewport({ width: 1920, height: 1080 });
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-        if (detectCloudflare(html)) {
-            throw new Error('Cloudflare challenge detected ("Just a moment...")');
-        }
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        log('info', 'Puppeteer succeeded', {
-            requestId,
-            targetUrl,
-            durationMs: Date.now() - start,
-            htmlBytes: Buffer.byteLength(html)
-        });
-
-        return html;
-    } catch (err) {
-        log('error', 'Puppeteer failed', {
-            requestId,
-            targetUrl,
-            durationMs: Date.now() - start,
-            ...getErrorDetails(err)
-        });
-
-        throw err;
-    } finally {
-        if (browser) {
-            try {
-                await browser.close();
-            } catch (err) {
-                log('warn', 'Failed to close Puppeteer browser', { requestId, ...getErrorDetails(err) });
+        // Wait out the Cloudflare interstitial if present
+        if (await isCloudflareActive(page, true)) {
+            log('info', 'Cloudflare challenge detected, waiting for resolution...', { requestId });
+            const cleared = await waitForCloudflareClear(page, requestId);
+            if (!cleared) {
+                throw new Error('Cloudflare challenge persisted / interactive verification required');
             }
         }
+
+        const html = await page.content();
+        log('info', 'Puppeteer succeeded', { requestId, targetUrl, durationMs: Date.now() - start });
+        return html;
+    } catch (err) {
+        log('error', 'Puppeteer failed', { requestId, targetUrl, ...getErrorDetails(err) });
+        throw err;
+    } finally {
+        if (browser) await browser.close().catch(() => {});
     }
 }
 
 // ---------------------------------------------------------
-// Playwright
+// Playwright (Evasion Enabled)
 // ---------------------------------------------------------
-
 async function scrapeWithPlaywright(targetUrl, requestId) {
     let browser;
     const start = Date.now();
-
     log('info', 'Playwright started', { requestId, targetUrl });
 
     try {
         browser = await playwrightChromium.launch({
             headless: true,
-            executablePath: CHROMIUM_PATH
+            executablePath: CHROMIUM_PATH,
+            args: [
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox'
+            ]
         });
 
-        const context = await browser.newContext();
+        const context = await browser.newContext({
+            viewport: { width: 1920, height: 1080 },
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+        });
+
+        // Inject stealth scripts before every page load
+        await context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            window.navigator.chrome = { runtime: {} };
+        });
+
         const page = await context.newPage();
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        await page.goto(targetUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
-        });
-
-        const html = await page.content();
-
-        if (detectCloudflare(html)) {
-            throw new Error('Cloudflare challenge detected ("Just a moment...")');
-        }
-
-        log('info', 'Playwright succeeded', {
-            requestId,
-            targetUrl,
-            durationMs: Date.now() - start,
-            htmlBytes: Buffer.byteLength(html)
-        });
-
-        return html;
-    } catch (err) {
-        log('error', 'Playwright failed', {
-            requestId,
-            targetUrl,
-            durationMs: Date.now() - start,
-            ...getErrorDetails(err)
-        });
-
-        throw err;
-    } finally {
-        if (browser) {
-            try {
-                await browser.close();
-            } catch (err) {
-                log('warn', 'Failed to close Playwright browser', { requestId, ...getErrorDetails(err) });
+        if (await isCloudflareActive(page, true)) {
+            log('info', 'Cloudflare challenge detected, waiting for resolution...', { requestId });
+            const cleared = await waitForCloudflareClear(page, requestId);
+            if (!cleared) {
+                throw new Error('Cloudflare challenge persisted / interactive verification required');
             }
         }
+
+        const html = await page.content();
+        log('info', 'Playwright succeeded', { requestId, targetUrl, durationMs: Date.now() - start });
+        return html;
+    } catch (err) {
+        log('error', 'Playwright failed', { requestId, targetUrl, ...getErrorDetails(err) });
+        throw err;
+    } finally {
+        if (browser) await browser.close().catch(() => {});
     }
 }
 
 // ---------------------------------------------------------
-// Selenium
+// Selenium (Evasion Enabled)
 // ---------------------------------------------------------
-
 async function scrapeWithSelenium(targetUrl, requestId) {
     let driver;
     const start = Date.now();
-
     log('info', 'Selenium started', { requestId, targetUrl });
 
     try {
         const options = new chrome.Options();
-
         options.setChromeBinaryPath(CHROMIUM_PATH);
         options.addArguments(
             '--headless',
             '--no-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu'
+            '--disable-gpu',
+            '--disable-blink-features=AutomationControlled',
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
         );
+        options.excludeSwitches('enable-automation');
+        options.setExperimentalOption('useAutomationExtension', false);
 
         driver = await new Builder()
             .forBrowser(Browser.CHROME)
@@ -219,107 +221,73 @@ async function scrapeWithSelenium(targetUrl, requestId) {
 
         await driver.get(targetUrl);
 
-        const html = await driver.getPageSource();
-
-        if (detectCloudflare(html)) {
-            throw new Error('Cloudflare challenge detected ("Just a moment...")');
-        }
-
-        log('info', 'Selenium succeeded', {
-            requestId,
-            targetUrl,
-            durationMs: Date.now() - start,
-            htmlBytes: Buffer.byteLength(html)
-        });
-
-        return html;
-    } catch (err) {
-        log('error', 'Selenium failed', {
-            requestId,
-            targetUrl,
-            durationMs: Date.now() - start,
-            ...getErrorDetails(err)
-        });
-
-        throw err;
-    } finally {
-        if (driver) {
-            try {
-                await driver.quit();
-            } catch (err) {
-                log('warn', 'Failed to close Selenium driver', { requestId, ...getErrorDetails(err) });
+        let html = await driver.getPageSource();
+        if (html.includes('Just a moment...')) {
+            log('info', 'Cloudflare challenge detected in Selenium, waiting...', { requestId });
+            const deadline = Date.now() + 15000;
+            while (Date.now() < deadline) {
+                html = await driver.getPageSource();
+                if (!html.includes('Just a moment...')) break;
+                await new Promise((r) => setTimeout(r, 1000));
             }
         }
+
+        if (html.includes('Just a moment...')) {
+            throw new Error('Cloudflare challenge persisted in Selenium');
+        }
+
+        log('info', 'Selenium succeeded', { requestId, targetUrl, durationMs: Date.now() - start });
+        return html;
+    } catch (err) {
+        log('error', 'Selenium failed', { requestId, targetUrl, ...getErrorDetails(err) });
+        throw err;
+    } finally {
+        if (driver) await driver.quit().catch(() => {});
     }
 }
 
 // ---------------------------------------------------------
-// Route
+// Route Handler (Waterfall Fallback)
 // ---------------------------------------------------------
-
 app.get('/', async (req, res) => {
     const { requestId } = req;
     const targetUrl = req.query.url;
 
     if (!targetUrl) {
-        log('warn', 'Request rejected: missing URL', { requestId });
         return res.status(400).send('Error: Please provide a URL using the ?url= query parameter.');
     }
 
     const errors = [];
+    const engines = [
+        { name: 'puppeteer', fn: scrapeWithPuppeteer },
+        { name: 'playwright', fn: scrapeWithPlaywright },
+        { name: 'selenium', fn: scrapeWithSelenium }
+    ];
 
-    // 1. Puppeteer
-    try {
-        log('info', 'Trying scraping engine', { requestId, engine: 'puppeteer', attempt: 1, totalAttempts: 3 });
-        const html = await scrapeWithPuppeteer(targetUrl, requestId);
+    for (const [index, engine] of engines.entries()) {
+        try {
+            log('info', 'Trying scraping engine', { requestId, engine: engine.name, attempt: index + 1, totalAttempts: engines.length });
+            const html = await engine.fn(targetUrl, requestId);
 
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.send(html);
-    } catch (err) {
-        errors.push(`Puppeteer: ${err.message}`);
-        log('warn', 'Moving to next scraping engine', { requestId, failedEngine: 'puppeteer', nextEngine: 'playwright' });
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            return res.send(html);
+        } catch (err) {
+            errors.push(`${engine.name}: ${err.message}`);
+            log('warn', 'Moving to next scraping engine', { requestId, failedEngine: engine.name });
+        }
     }
 
-    // 2. Playwright
-    try {
-        log('info', 'Trying scraping engine', { requestId, engine: 'playwright', attempt: 2, totalAttempts: 3 });
-        const html = await scrapeWithPlaywright(targetUrl, requestId);
-
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.send(html);
-    } catch (err) {
-        errors.push(`Playwright: ${err.message}`);
-        log('warn', 'Moving to next scraping engine', { requestId, failedEngine: 'playwright', nextEngine: 'selenium' });
-    }
-
-    // 3. Selenium
-    try {
-        log('info', 'Trying scraping engine', { requestId, engine: 'selenium', attempt: 3, totalAttempts: 3 });
-        const html = await scrapeWithSelenium(targetUrl, requestId);
-
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.send(html);
-    } catch (err) {
-        errors.push(`Selenium: ${err.message}`);
-        log('error', 'All scraping engines failed', { requestId, targetUrl, errors });
-
-        return res.status(500).send(
-            `All scraping engines failed.<br><br>` +
-            `Request ID: ${requestId}<br><br>` +
-            `Errors:<br>- ${errors.join('<br>- ')}`
-        );
-    }
+    log('error', 'All scraping engines failed', { requestId, targetUrl, errors });
+    return res.status(500).send(
+        `All scraping engines failed due to Cloudflare protection.<br><br>` +
+        `Request ID: ${requestId}<br><br>` +
+        `Errors:<br>- ${errors.join('<br>- ')}`
+    );
 });
 
 // ---------------------------------------------------------
 // Server
 // ---------------------------------------------------------
-
 app.listen(PORT, () => {
-    log('info', 'Multi-engine scraper started', {
-        port: PORT,
-        chromiumPath: CHROMIUM_PATH,
-        nodeVersion: process.version,
-        environment: process.env.NODE_ENV || 'development'
-    });
+    log('info', 'Stealth multi-engine scraper started', { port: PORT, chromiumPath: CHROMIUM_PATH });
 });
