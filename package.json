@@ -1,7 +1,7 @@
 {
   "name": "spider-for-web",
   "version": "1.0.0",
-  "description": "Scrape website HTML using Selenium with Playwright fallback on Render",
+  "description": "Scraping service with Puppeteer -> Playwright -> Selenium fallback chain",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +9,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "playwright": "^1.45.0",
+    "puppeteer": "^22.12.0",
     "selenium-webdriver": "^4.21.0"
   }
 }
