@@ -13,7 +13,7 @@ const CHROMIUM_PATH =
     '/ms-playwright/chromium-1124/chrome-linux/chrome';
 
 // ---------------------------------------------------------
-// Logging
+// Logging & Helpers
 // ---------------------------------------------------------
 
 function log(level, message, meta = {}) {
@@ -37,13 +37,17 @@ function getErrorDetails(err) {
     };
 }
 
+function detectCloudflare(html) {
+    // Checks for common Cloudflare challenge indicators
+    return html.includes('Just a moment...') || html.includes('cf-browser-verification');
+}
+
 // Add request ID to every request
 app.use((req, res, next) => {
     const requestId = crypto.randomUUID();
     const start = Date.now();
 
     req.requestId = requestId;
-
     res.setHeader('X-Request-ID', requestId);
 
     log('info', 'Request started', {
@@ -74,10 +78,7 @@ async function scrapeWithPuppeteer(targetUrl, requestId) {
     let browser;
     const start = Date.now();
 
-    log('info', 'Puppeteer started', {
-        requestId,
-        targetUrl
-    });
+    log('info', 'Puppeteer started', { requestId, targetUrl });
 
     try {
         browser = await puppeteer.launch({
@@ -99,6 +100,10 @@ async function scrapeWithPuppeteer(targetUrl, requestId) {
         });
 
         const html = await page.content();
+
+        if (detectCloudflare(html)) {
+            throw new Error('Cloudflare challenge detected ("Just a moment...")');
+        }
 
         log('info', 'Puppeteer succeeded', {
             requestId,
@@ -122,10 +127,7 @@ async function scrapeWithPuppeteer(targetUrl, requestId) {
             try {
                 await browser.close();
             } catch (err) {
-                log('warn', 'Failed to close Puppeteer browser', {
-                    requestId,
-                    ...getErrorDetails(err)
-                });
+                log('warn', 'Failed to close Puppeteer browser', { requestId, ...getErrorDetails(err) });
             }
         }
     }
@@ -139,10 +141,7 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
     let browser;
     const start = Date.now();
 
-    log('info', 'Playwright started', {
-        requestId,
-        targetUrl
-    });
+    log('info', 'Playwright started', { requestId, targetUrl });
 
     try {
         browser = await playwrightChromium.launch({
@@ -159,6 +158,10 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
         });
 
         const html = await page.content();
+
+        if (detectCloudflare(html)) {
+            throw new Error('Cloudflare challenge detected ("Just a moment...")');
+        }
 
         log('info', 'Playwright succeeded', {
             requestId,
@@ -182,10 +185,7 @@ async function scrapeWithPlaywright(targetUrl, requestId) {
             try {
                 await browser.close();
             } catch (err) {
-                log('warn', 'Failed to close Playwright browser', {
-                    requestId,
-                    ...getErrorDetails(err)
-                });
+                log('warn', 'Failed to close Playwright browser', { requestId, ...getErrorDetails(err) });
             }
         }
     }
@@ -199,10 +199,7 @@ async function scrapeWithSelenium(targetUrl, requestId) {
     let driver;
     const start = Date.now();
 
-    log('info', 'Selenium started', {
-        requestId,
-        targetUrl
-    });
+    log('info', 'Selenium started', { requestId, targetUrl });
 
     try {
         const options = new chrome.Options();
@@ -223,6 +220,10 @@ async function scrapeWithSelenium(targetUrl, requestId) {
         await driver.get(targetUrl);
 
         const html = await driver.getPageSource();
+
+        if (detectCloudflare(html)) {
+            throw new Error('Cloudflare challenge detected ("Just a moment...")');
+        }
 
         log('info', 'Selenium succeeded', {
             requestId,
@@ -246,10 +247,7 @@ async function scrapeWithSelenium(targetUrl, requestId) {
             try {
                 await driver.quit();
             } catch (err) {
-                log('warn', 'Failed to close Selenium driver', {
-                    requestId,
-                    ...getErrorDetails(err)
-                });
+                log('warn', 'Failed to close Selenium driver', { requestId, ...getErrorDetails(err) });
             }
         }
     }
@@ -264,84 +262,46 @@ app.get('/', async (req, res) => {
     const targetUrl = req.query.url;
 
     if (!targetUrl) {
-        log('warn', 'Request rejected: missing URL', {
-            requestId
-        });
-
-        return res.status(400).send(
-            'Error: Please provide a URL using the ?url= query parameter.'
-        );
+        log('warn', 'Request rejected: missing URL', { requestId });
+        return res.status(400).send('Error: Please provide a URL using the ?url= query parameter.');
     }
 
     const errors = [];
 
     // 1. Puppeteer
     try {
-        log('info', 'Trying scraping engine', {
-            requestId,
-            engine: 'puppeteer',
-            attempt: 1,
-            totalAttempts: 3
-        });
-
+        log('info', 'Trying scraping engine', { requestId, engine: 'puppeteer', attempt: 1, totalAttempts: 3 });
         const html = await scrapeWithPuppeteer(targetUrl, requestId);
 
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.send(html);
     } catch (err) {
         errors.push(`Puppeteer: ${err.message}`);
-
-        log('warn', 'Moving to next scraping engine', {
-            requestId,
-            failedEngine: 'puppeteer',
-            nextEngine: 'playwright'
-        });
+        log('warn', 'Moving to next scraping engine', { requestId, failedEngine: 'puppeteer', nextEngine: 'playwright' });
     }
 
     // 2. Playwright
     try {
-        log('info', 'Trying scraping engine', {
-            requestId,
-            engine: 'playwright',
-            attempt: 2,
-            totalAttempts: 3
-        });
-
+        log('info', 'Trying scraping engine', { requestId, engine: 'playwright', attempt: 2, totalAttempts: 3 });
         const html = await scrapeWithPlaywright(targetUrl, requestId);
 
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.send(html);
     } catch (err) {
         errors.push(`Playwright: ${err.message}`);
-
-        log('warn', 'Moving to next scraping engine', {
-            requestId,
-            failedEngine: 'playwright',
-            nextEngine: 'selenium'
-        });
+        log('warn', 'Moving to next scraping engine', { requestId, failedEngine: 'playwright', nextEngine: 'selenium' });
     }
 
     // 3. Selenium
     try {
-        log('info', 'Trying scraping engine', {
-            requestId,
-            engine: 'selenium',
-            attempt: 3,
-            totalAttempts: 3
-        });
-
+        log('info', 'Trying scraping engine', { requestId, engine: 'selenium', attempt: 3, totalAttempts: 3 });
         const html = await scrapeWithSelenium(targetUrl, requestId);
 
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.send(html);
     } catch (err) {
         errors.push(`Selenium: ${err.message}`);
-
-        log('error', 'All scraping engines failed', {
-            requestId,
-            targetUrl,
-            errors
-        });
+        log('error', 'All scraping engines failed', { requestId, targetUrl, errors });
 
         return res.status(500).send(
             `All scraping engines failed.<br><br>` +
