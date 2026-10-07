@@ -13,7 +13,7 @@ const PORT = Number(process.env.PORT) || 3000;
 // ---------------------------------------------------------
 
 const NAVIGATION_TIMEOUT = 30_000;
-const CHALLENGE_WAIT_TIMEOUT = 15_000;
+const CHALLENGE_WAIT_TIMEOUT = 120_000;
 const POST_NAVIGATION_WAIT = 1_000;
 
 // ---------------------------------------------------------
