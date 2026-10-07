@@ -209,9 +209,7 @@ async function isCloudflareActive(page) {
     const challengeContent =
         html.includes('Just a moment...') ||
         html.includes('cf-browser-verification') ||
-        html.includes('cf-chl-') ||
-        html.includes('challenge-platform') ||
-        html.includes('__cf_chl_');
+        html.includes('cf-chl-');
 
     return challengeTitle || challengeContent;
 }
@@ -288,7 +286,8 @@ async function scrapeWithPlaywright(
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled'
             ]
         });
 
@@ -306,9 +305,18 @@ async function scrapeWithPlaywright(
                 height: 1080
             },
 
+            userAgent:
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+
             locale: 'en-US',
 
             timezoneId: 'UTC'
+        });
+
+        await context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false
+            });
         });
 
         // -------------------------------------------------
